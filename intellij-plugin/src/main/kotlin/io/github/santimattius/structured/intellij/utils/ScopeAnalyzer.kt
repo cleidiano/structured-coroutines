@@ -202,9 +202,12 @@ object ScopeAnalyzer {
 
     /**
      * Checks if a deferred is awaited within the same scope.
-     * Handles: direct assignment (val d = async {}; d.await()), and async inside initializer (val defs = xs.map { async {} }; defs.awaitAll()).
+     * Handles: direct assignment (val d = async {}; d.await()), async inside initializer
+     * (val defs = xs.map { async {} }; defs.awaitAll()), and chains (xs.map { async {} }.awaitAll()).
      */
     fun isDeferredAwaited(asyncCall: KtCallExpression): Boolean {
+        if (isAwaitedByEnclosingChain(asyncCall)) return true
+
         val parent = asyncCall.parent
 
         // Check if async is assigned to a variable (direct or inside initializer, e.g. val defs = xs.map { async {} })
@@ -227,6 +230,43 @@ object ScopeAnalyzer {
         }
 
         return false
+    }
+
+    private val AWAIT_CALLS = setOf("await", "awaitAll")
+
+    // Climbs from the async call while its value keeps flowing outward (call chains, lambda results)
+    // and stops at the first await/awaitAll. Intermediate call names don't matter: types guarantee
+    // that whatever reaches awaitAll() is a collection of Deferreds.
+    private fun isAwaitedByEnclosingChain(asyncCall: KtCallExpression): Boolean {
+        var current: KtExpression = asyncCall
+        while (true) {
+            val parent = current.parent
+            current = when {
+                parent is KtQualifiedExpression && parent.selectorExpression == current -> parent
+                parent is KtQualifiedExpression && parent.receiverExpression == current -> {
+                    val selector = parent.selectorExpression as? KtCallExpression
+                    if (selector?.calleeExpression?.text in AWAIT_CALLS) return true
+                    parent
+                }
+                parent is KtParenthesizedExpression -> parent
+                parent is KtValueArgument -> {
+                    val call = parent.getParentOfType<KtCallExpression>(strict = true) ?: return false
+                    return call.calleeExpression?.text == "awaitAll"
+                }
+                parent is KtBlockExpression && parent.statements.lastOrNull() == current ->
+                    lambdaOwnerCall(parent) ?: return false
+                else -> return false
+            }
+        }
+    }
+
+    private fun lambdaOwnerCall(lambdaBody: KtBlockExpression): KtCallExpression? {
+        val lambda = (lambdaBody.parent as? KtFunctionLiteral)?.parent as? KtLambdaExpression ?: return null
+        return when (val holder = lambda.parent) {
+            is KtLambdaArgument -> holder.parent as? KtCallExpression
+            is KtValueArgument -> holder.parent?.parent as? KtCallExpression
+            else -> null
+        }
     }
 
     private fun findPropertyContainingAsync(asyncCall: KtCallExpression): KtProperty? {
