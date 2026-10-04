@@ -206,7 +206,7 @@ object ScopeAnalyzer {
      * (val defs = xs.map { async {} }; defs.awaitAll()), and chains (xs.map { async {} }.awaitAll()).
      */
     fun isDeferredAwaited(asyncCall: KtCallExpression): Boolean {
-        if (isAwaitedByEnclosingChain(asyncCall)) return true
+        if (flowsToAwait(asyncCall)) return true
 
         val parent = asyncCall.parent
 
@@ -237,8 +237,8 @@ object ScopeAnalyzer {
     // Climbs from the async call while its value keeps flowing outward (call chains, lambda results)
     // and stops at the first await/awaitAll. Intermediate call names don't matter: types guarantee
     // that whatever reaches awaitAll() is a collection of Deferreds.
-    private fun isAwaitedByEnclosingChain(asyncCall: KtCallExpression): Boolean {
-        var current: KtExpression = asyncCall
+    private fun flowsToAwait(start: KtExpression): Boolean {
+        var current: KtExpression = start
         while (true) {
             val parent = current.parent
             current = when {
@@ -255,9 +255,19 @@ object ScopeAnalyzer {
                 }
                 parent is KtBlockExpression && parent.statements.lastOrNull() == current ->
                     lambdaOwnerCall(parent) ?: return false
+                parent is KtProperty && parent.initializer == current -> return variableFlowsToAwait(parent)
                 else -> return false
             }
         }
+    }
+
+    // Name-based like the legacy path; terminates because each hop moves to a later declaration.
+    private fun variableFlowsToAwait(property: KtProperty): Boolean {
+        val name = property.name ?: return false
+        val scope = property.parent as? KtBlockExpression ?: return false
+        return scope.collectDescendantsOfType<KtNameReferenceExpression> {
+            it.getReferencedName() == name && it.textOffset > property.textOffset
+        }.any { flowsToAwait(it) }
     }
 
     private fun lambdaOwnerCall(lambdaBody: KtBlockExpression): KtCallExpression? {
