@@ -234,9 +234,9 @@ object ScopeAnalyzer {
 
     private val AWAIT_CALLS = setOf("await", "awaitAll")
 
-    // Climbs from the async call while its value keeps flowing outward (call chains, lambda results)
-    // and stops at the first await/awaitAll. Intermediate call names don't matter: types guarantee
-    // that whatever reaches awaitAll() is a collection of Deferreds.
+    // Climbs from the async call while its value keeps flowing outward (call chains, call arguments,
+    // lambda results) and stops at the first await/awaitAll. Intermediate call names don't matter:
+    // types guarantee that whatever reaches awaitAll() is a collection of Deferreds.
     private fun flowsToAwait(start: KtExpression): Boolean {
         var current: KtExpression = start
         while (true) {
@@ -251,7 +251,8 @@ object ScopeAnalyzer {
                 parent is KtParenthesizedExpression -> parent
                 parent is KtValueArgument -> {
                     val call = parent.getParentOfType<KtCallExpression>(strict = true) ?: return false
-                    return call.calleeExpression?.text == "awaitAll"
+                    if (call.calleeExpression?.text == "awaitAll") return true
+                    call
                 }
                 parent is KtBlockExpression && parent.statements.lastOrNull() == current ->
                     lambdaOwnerCall(parent) ?: return false
