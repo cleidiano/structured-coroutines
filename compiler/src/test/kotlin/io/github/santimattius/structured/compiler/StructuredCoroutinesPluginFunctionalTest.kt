@@ -1336,6 +1336,117 @@ class StructuredCoroutinesPluginFunctionalTest {
     }
 
     // ============================================================================
+    // UNUSED_DEFERRED await lookup in any statement position (SCOPE_002)
+    // ============================================================================
+
+    @Test
+    fun `Deferred awaited in any statement position does not report UNUSED_DEFERRED`() {
+        // Each function used to be a false positive: the await lookup only descended into
+        // statements that were themselves calls or blocks, and compared variables by name.
+        val sourceCode = """
+            import kotlinx.coroutines.*
+            import io.github.santimattius.structured.annotations.StructuredScope
+
+            suspend fun awaitIntoVal(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                val r = d.await()
+            }
+
+            suspend fun returnAwait(@StructuredScope scope: CoroutineScope): Int {
+                val d = scope.async { 1 }
+                return d.await()
+            }
+
+            suspend fun awaitAsArgument(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                println(d.await())
+            }
+
+            suspend fun awaitInIf(@StructuredScope scope: CoroutineScope, flag: Boolean) {
+                val d = scope.async { 1 }
+                if (flag) d.await() else d.cancel()
+            }
+
+            suspend fun awaitInTry(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                try {
+                    d.await()
+                } finally {
+                    println("done")
+                }
+            }
+
+            suspend fun awaitAllVararg(@StructuredScope scope: CoroutineScope) {
+                val a = scope.async { 1 }
+                val b = scope.async { 2 }
+                awaitAll(a, b)
+            }
+
+            suspend fun awaitAllOnCollection(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                listOf(d).awaitAll()
+            }
+
+            suspend fun awaitThroughAlias(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                val e = d
+                e.await()
+            }
+
+            fun awaitInsideLaunch(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                scope.launch { d.await() }
+            }
+        """.trimIndent()
+
+        val projectDir = createTestProject(sourceCode)
+        val output = runBuild(projectDir, expectSuccess = true)
+
+        assertTrue(
+            "UNUSED_DEFERRED" !in output && "[SCOPE_002]" !in output,
+            "Did not expect UNUSED_DEFERRED for Deferreds awaited in any statement position but got:\n$output"
+        )
+    }
+
+    @Test
+    fun `Deferred never awaited still reports UNUSED_DEFERRED`() {
+        // Guards against the broader lookup becoming too lenient: cancel() is not an await, and
+        // awaiting a different Deferred must not count (variables are matched by symbol).
+        val sourceCode = """
+            import kotlinx.coroutines.*
+            import io.github.santimattius.structured.annotations.StructuredScope
+
+            fun neverUsed(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+            }
+
+            fun onlyCancelled(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                d.cancel()
+            }
+
+            suspend fun otherDeferredAwaited(@StructuredScope scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                val other = scope.async { 2 }
+                other.await()
+            }
+        """.trimIndent()
+
+        val projectDir = createTestProject(sourceCode)
+        val output = runBuild(projectDir, expectSuccess = false)
+
+        val reportedLines = Regex("""Test\.kt:(\d+):\d+ \[SCOPE_002]""")
+            .findAll(output)
+            .map { it.groupValues[1].toInt() }
+            .toSet()
+        assertEquals(
+            setOf(5, 9, 14),
+            reportedLines,
+            "Expected UNUSED_DEFERRED exactly on the unawaited `d` in each function but got:\n$output"
+        )
+    }
+
+    // ============================================================================
     // CLI bridge (#68, ADR-3, Phase 0/1) — StructuredCoroutinesCommandLineProcessor +
     // META-INF/services registration. Before this bridge existed, every SubpluginOption the
     // Gradle plugin emits for the 14 rule keys was silently dropped: no CommandLineProcessor was

@@ -10,19 +10,21 @@
 package io.github.santimattius.structured.compiler
 
 import org.jetbrains.kotlin.diagnostics.DiagnosticReporter
+import org.jetbrains.kotlin.fir.FirElement
 import org.jetbrains.kotlin.fir.analysis.checkers.MppCheckerKind
 import org.jetbrains.kotlin.fir.analysis.checkers.context.CheckerContext
 import org.jetbrains.kotlin.fir.analysis.checkers.expression.FirFunctionCallChecker
 import org.jetbrains.kotlin.fir.declarations.FirNamedFunction
+import org.jetbrains.kotlin.fir.declarations.FirProperty
 import org.jetbrains.kotlin.fir.declarations.FirVariable
+import org.jetbrains.kotlin.fir.symbols.FirBasedSymbol
 import org.jetbrains.kotlin.fir.symbols.SymbolInternals
 import org.jetbrains.kotlin.fir.expressions.FirBlock
 import org.jetbrains.kotlin.fir.expressions.FirExpression
 import org.jetbrains.kotlin.fir.expressions.FirFunctionCall
 import org.jetbrains.kotlin.fir.expressions.FirPropertyAccessExpression
-import org.jetbrains.kotlin.fir.expressions.FirStatement
 import org.jetbrains.kotlin.fir.references.toResolvedCallableSymbol
-import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
+import org.jetbrains.kotlin.fir.visitors.FirVisitorVoid
 import org.jetbrains.kotlin.name.Name
 
 /**
@@ -53,15 +55,17 @@ import org.jetbrains.kotlin.name.Name
  *
  * ## Detection Logic
  *
- * 1. Identifies `async` calls that are assigned to variables
- * 2. Analyzes the containing block for `.await()` calls on that variable
- * 3. Reports error if no `.await()` is found in the same block
+ * 1. Identifies `async` calls assigned to a `val` directly in the function body
+ * 2. Collects that variable plus local aliases of it (`val e = d`)
+ * 3. Walks the whole function body for an `await()` / `awaitAll()` call whose receiver or
+ *    arguments reference one of those variables, in any statement position
+ *    (`val r = d.await()`, `return d.await()`, `listOf(d).awaitAll()`, inside lambdas, ...)
+ * 4. Reports if no such call is found
  *
  * ## Limitations
  *
- * - Only detects cases in the same block (doesn't cross function boundaries)
- * - Doesn't detect cases where Deferred is passed as parameter
- * - Doesn't detect complex expressions using the Deferred
+ * - Only analyzes `val d = async { }` declared directly in the function body
+ * - Doesn't follow the Deferred across function boundaries (passed as parameter, returned)
  *
  * @see StructuredCoroutinesErrors.UNUSED_DEFERRED
  */
@@ -76,59 +80,29 @@ class UnusedDeferredChecker(
         private val ASYNC_NAME = Name.identifier("async")
 
         /**
-         * Name of the await function to detect.
+         * Names of the calls that consume a Deferred.
          */
-        private val AWAIT_NAME = Name.identifier("await")
-
-        /**
-         * Name of the awaitAll function to detect.
-         */
-        private val AWAIT_ALL_NAME = Name.identifier("awaitAll")
+        private val AWAIT_NAMES = setOf(Name.identifier("await"), Name.identifier("awaitAll"))
     }
 
     context(context: CheckerContext, reporter: DiagnosticReporter)
     override fun check(expression: FirFunctionCall) {
-        // Check if this is an async call
         if (expression.calleeReference.name != ASYNC_NAME) return
 
-        // Find the containing block
         val containingBlock = findContainingBlock(expression, context) ?: return
+        val deferred = findAssignedVariable(expression, containingBlock) ?: return
+        val targets = collectAliases(containingBlock, deferred)
 
-        // Check if this async is part of a variable assignment
-        // We'll look for the variable in the same statement
-        val variableName = findVariableNameFromStatement(expression, containingBlock, context) ?: return
-
-        // Check if await() is called on this variable in the same block
-        if (!hasAwaitCall(containingBlock, variableName, context)) {
+        if (!isAwaited(containingBlock, targets)) {
             reporter.reportUnusedDeferred(expression, context, config)
         }
     }
 
     /**
-     * Finds the variable name if the async call is assigned to a variable in the same statement.
-     *
-     * @param expression The async call expression
-     * @param block The containing block
-     * @param context The checker context
-     * @return The variable name if found, null otherwise
+     * Returns the symbol of the `val` declared directly in [block] whose initializer is [expression].
      */
-    private fun findVariableNameFromStatement(
-        expression: FirFunctionCall,
-        block: FirBlock,
-        context: CheckerContext
-    ): Name? {
-        // Look for the statement containing this expression
-        for (statement in block.statements) {
-            if (statement is FirVariable) {
-                // Check if the initializer is our async call
-                val initializer = statement.initializer
-                if (initializer == expression) {
-                    return statement.name
-                }
-            }
-        }
-        return null
-    }
+    private fun findAssignedVariable(expression: FirFunctionCall, block: FirBlock): FirBasedSymbol<*>? =
+        block.statements.filterIsInstance<FirVariable>().firstOrNull { it.initializer == expression }?.symbol
 
     /**
      * Finds the containing block for the expression.
@@ -160,77 +134,53 @@ class UnusedDeferredChecker(
     }
 
     /**
-     * Checks if there's an await() call on the given variable in the block.
-     *
-     * @param block The block to search
-     * @param variableName The name of the variable to check
-     * @param context The checker context
-     * @return true if await() is found, false otherwise
+     * Returns [deferred] plus every local `val` that aliases it, directly or transitively
+     * (`val e = d`, `val f = e`). The visitor runs in source order, so chains resolve in one pass.
      */
-    private fun hasAwaitCall(
-        block: FirBlock,
-        variableName: Name,
-        context: CheckerContext
-    ): Boolean {
-        for (statement in block.statements) {
-            if (containsAwaitCall(statement, variableName, context)) {
-                return true
+    private fun collectAliases(block: FirBlock, deferred: FirBasedSymbol<*>): Set<FirBasedSymbol<*>> {
+        val targets = mutableSetOf(deferred)
+        block.acceptChildren(object : FirVisitorVoid() {
+            override fun visitElement(element: FirElement) {
+                if (element is FirProperty && element.initializer?.isReferenceTo(targets) == true) {
+                    targets += element.symbol
+                }
+                element.acceptChildren(this)
             }
-        }
-        return false
+        })
+        return targets
     }
 
     /**
-     * Recursively checks if a statement contains an await() call on the variable.
-     *
-     * @param statement The statement to check
-     * @param variableName The variable name to look for
-     * @param context The checker context
-     * @return true if await() is found
+     * Whether any `await()` / `awaitAll()` call in [block] references one of [targets] in its
+     * receiver or arguments. Lambdas and local functions are searched too: an await there still
+     * consumes the Deferred, and being lenient here can only suppress a report, never add one.
      */
-    private fun containsAwaitCall(
-        statement: FirStatement,
-        variableName: Name,
-        context: CheckerContext
-    ): Boolean {
-        when (statement) {
-            is FirFunctionCall -> {
-                // Check if this is await() or awaitAll()
-                val calleeName = statement.calleeReference.name
-                if (calleeName == AWAIT_NAME || calleeName == AWAIT_ALL_NAME) {
-                    // Check if the receiver is our variable
-                    val receiver = statement.explicitReceiver
-                    if (receiver is FirPropertyAccessExpression) {
-                        val receiverName = receiver.calleeReference.name
-                        if (receiverName == variableName) {
-                            return true
-                        }
-                    }
-                }
-
-                // Recursively check arguments (for awaitAll with multiple deferreds)
-                for (argument in statement.argumentList.arguments) {
-                    if (argument is FirPropertyAccessExpression) {
-                        val argName = argument.calleeReference.name
-                        if (argName == variableName) {
-                            return true
-                        }
-                    }
-                    if (argument is FirBlock) {
-                        if (hasAwaitCall(argument, variableName, context)) {
-                            return true
-                        }
-                    }
-                }
-            }
-            is FirBlock -> {
-                for (innerStatement in statement.statements) {
-                    if (containsAwaitCall(innerStatement, variableName, context)) {
-                        return true
-                    }
-                }
-            }
+    private fun isAwaited(block: FirBlock, targets: Set<FirBasedSymbol<*>>): Boolean =
+        block.containsMatch { element ->
+            element is FirFunctionCall &&
+                element.calleeReference.name in AWAIT_NAMES &&
+                element.containsMatch { it.isReferenceTo(targets) }
         }
-        return false
+
+    private fun FirElement.isReferenceTo(targets: Set<FirBasedSymbol<*>>): Boolean =
+        this is FirPropertyAccessExpression &&
+            calleeReference.toResolvedCallableSymbol()?.let { it in targets } == true
+
+    /**
+     * Depth-first search over the descendants of this element, short-circuiting on the first match.
+     */
+    private fun FirElement.containsMatch(predicate: (FirElement) -> Boolean): Boolean {
+        var found = false
+        acceptChildren(object : FirVisitorVoid() {
+            override fun visitElement(element: FirElement) {
+                if (found) return
+                if (predicate(element)) {
+                    found = true
+                    return
+                }
+                element.acceptChildren(this)
+            }
+        })
+        return found
     }
 }
