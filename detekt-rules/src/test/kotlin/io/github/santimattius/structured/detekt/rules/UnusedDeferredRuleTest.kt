@@ -111,12 +111,133 @@ class UnusedDeferredRuleTest {
     fun `does not report launch`() {
         val code = """
             import kotlinx.coroutines.*
-            
+
             fun test(scope: CoroutineScope) {
                 scope.launch { }
             }
         """.trimIndent()
         val findings = rule.compileAndLint(code)
         assertThat(findings).isEmpty()
+    }
+
+    @Test
+    fun `does not report async awaited through a chain in a val initializer`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            suspend fun test(scope: CoroutineScope, xs: List<Int>) {
+                val r = xs.map { scope.async { it } }.awaitAll()
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).isEmpty()
+    }
+
+    @Test
+    fun `does not report async awaited directly in a val initializer`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            suspend fun test(scope: CoroutineScope) {
+                val r = scope.async { 1 }.await()
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).isEmpty()
+    }
+
+    @Test
+    fun `does not report async awaited inside a launch assigned to a val`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            fun test(scope: CoroutineScope, xs: List<Int>) {
+                val job = scope.launch { xs.map { async { it } }.awaitAll() }
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).isEmpty()
+    }
+
+    @Test
+    fun `does not report async held in a val that is the awaited lambda result`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            suspend fun test(scope: CoroutineScope, xs: List<Int>) {
+                xs.map { val d = scope.async { it }; d }.awaitAll()
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).isEmpty()
+    }
+
+    @Test
+    fun `does not report async awaited through an alias`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            suspend fun test(scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                val e = d
+                e.await()
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).isEmpty()
+    }
+
+    @Test
+    fun `does not report async awaited inside a collection`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            suspend fun test(scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                listOf(d).awaitAll()
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).isEmpty()
+    }
+
+    @Test
+    fun `reports async put in a collection that is never awaited`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            fun test(scope: CoroutineScope) {
+                val d = scope.async { 1 }
+                listOf(d)
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).hasSize(1)
+    }
+
+    @Test
+    fun `reports async returned from a lambda whose result is never awaited`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            fun test(scope: CoroutineScope, xs: List<Int>) {
+                val defs = xs.map { val d = scope.async { it }; d }
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).hasSize(1)
+    }
+
+    @Test
+    fun `reports async inside a launch assigned to a val when never awaited`() {
+        val code = """
+            import kotlinx.coroutines.*
+
+            fun test(scope: CoroutineScope) {
+                val job = scope.launch { async { 1 } }
+            }
+        """.trimIndent()
+        val findings = rule.compileAndLint(code)
+        assertThat(findings).hasSize(1)
     }
 }
