@@ -14,11 +14,14 @@ object LintTestStubs {
         import kotlin.coroutines.CoroutineContext
         interface CoroutineScope
         interface Job : CoroutineContext.Element
+        interface Deferred<out T> : Job {
+            suspend fun await(): T
+        }
         suspend fun delay(timeMillis: Long) {}
         fun <T> runBlocking(block: suspend CoroutineScope.() -> T): T = error("stub")
         object GlobalScope : CoroutineScope
         fun CoroutineScope.launch(context: CoroutineContext = error("stub"), block: suspend CoroutineScope.() -> Unit): Job = error("stub")
-        fun CoroutineScope.async(context: CoroutineContext = error("stub"), block: suspend CoroutineScope.() -> Any): Any = error("stub")
+        fun <T> CoroutineScope.async(context: CoroutineContext = error("stub"), block: suspend CoroutineScope.() -> T): Deferred<T> = error("stub")
         suspend fun <T> withContext(context: CoroutineContext, block: suspend CoroutineScope.() -> T): T = error("stub")
         fun Job(parent: Job? = null): Job = error("stub")
         fun SupervisorJob(parent: Job? = null): Job = error("stub")
